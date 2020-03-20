@@ -21,7 +21,14 @@ def decode(o):
 
 @singledispatch
 def encode(o):
-    return json.JSONEncoder.default(o)
+    return json.JSONEncoder().default(o)
+
+
+def wrapped_encode(o):
+    try:
+        return encode(o)
+    except TypeError:
+        return str(o)
 
 
 @encode.register(datetime.datetime)
@@ -38,3 +45,5 @@ load = partial(json.load, object_hook=decode)
 loads = partial(json.loads, object_hook=decode)
 dump = partial(json.dump, default=encode)
 dumps = partial(json.dumps, default=encode)
+
+force_dumps = partial(json.dumps, default=wrapped_encode)
