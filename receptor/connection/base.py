@@ -4,6 +4,7 @@ import os
 from abc import abstractmethod, abstractproperty
 from collections.abc import AsyncIterator
 
+from .. import fileio
 from ..bridgequeue import BridgeQueue
 from ..messages.framed import FramedBuffer
 
@@ -97,7 +98,7 @@ class Worker:
             logger.debug(f"Watching queue {str(self.conn)}")
             while not self.conn.closed:
                 try:
-                    ident, fp = await asyncio.wait_for(self.outbound.get(handle_only=True), 5.0)
+                    ident, fp = await asyncio.wait_for(self.outbound.get(), 5.0)
                     if not fp:
                         await self.close()
                 except asyncio.TimeoutError:
@@ -106,7 +107,7 @@ class Worker:
                     logger.exception("watch_queue: error getting data from buffer")
                     continue
                 else:
-                    asyncio.ensure_future(self.drain_buf(ident, fp))
+                    asyncio.ensure_future(self.drain_buf(ident, fp._fp))
 
         except asyncio.CancelledError:
             logger.debug("watch_queue: cancel request received")
@@ -118,16 +119,14 @@ class Worker:
                 logger.debug("Message not sent: connection already closed")
             else:
                 q = BridgeQueue(maxsize=1)
-                await asyncio.gather(
-                    self.loop.run_in_executor(None, q.read_from, fp), self.conn.send(q)
-                )
+                await asyncio.gather(fileio.run_in_executor(q.read_from, fp), self.conn.send(q))
         except Exception:
             logger.exception("watch_queue: error received trying to write")
             await self.outbound.put_ident(ident)
             return await self.close()
         else:
             try:
-                await self.loop.run_in_executor(None, os.remove, fp.name)
+                await fileio.run_in_executor(os.remove, fp.name)
             except TypeError:
                 logger.exception("failed to os.remove %s", fp)
                 pass  # some messages aren't actually files

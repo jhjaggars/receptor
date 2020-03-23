@@ -4,13 +4,12 @@ import logging
 import os
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from json.decoder import JSONDecodeError
 
+from .. import fileio
 from .. import serde as json
 
 logger = logging.getLogger(__name__)
-pool = ThreadPoolExecutor()
 
 
 class DurableBuffer:
@@ -22,54 +21,70 @@ class DurableBuffer:
         self._loop = loop
         self._manifest_lock = asyncio.Lock(loop=self._loop)
         self._manifest_dirty = False
+        self._write_time = write_time
+        self.ready = asyncio.Event()
+        self._loop.create_task(self.start_manifest())
+
+    async def start_manifest(self):
         try:
             os.makedirs(self._message_path, mode=0o700)
         except Exception:
             pass
-        for item in self._read_manifest():
-            self.q.put_nowait(item)
-        self._loop.create_task(self.manifest_writer(write_time))
+
+        loaded_items = await self._read_manifest()
+        for item in loaded_items:
+            await self.q.put(item)
+
+        self.ready.set()
+        self._loop.create_task(self.manifest_writer(self._write_time))
 
     async def put(self, framed_message):
+        await self.ready.wait()
+        path = os.path.join(self._message_path, str(uuid.uuid4()))
         item = {
-            "ident": str(uuid.uuid4()),
+            "path": path,
             "expire_time": datetime.datetime.utcnow() + datetime.timedelta(minutes=5),
         }
-        await self._loop.run_in_executor(pool, self._write_file, framed_message, item)
-        await self.q.put(item)
-        self._manifest_dirty = True
+        async with fileio.Opened(path, "wb") as fp:
+            if isinstance(framed_message, bytes):
+                await fp.write(framed_message)
+            else:
+                for chunk in framed_message:
+                    await fp.write(chunk)
+
+        await self.put_ident(item)
 
     async def put_ident(self, ident):
         await self.q.put(ident)
         self._manifest_dirty = True
 
-    async def get(self, handle_only=False, delete=True):
+    async def get(self):
+        await self.ready.wait()
         while True:
             ident = await self.q.get()
             self._manifest_dirty = True
+            file_path = ident["path"]
             try:
-                f = await self._get_file(ident["ident"], handle_only=handle_only, delete=delete)
+                f = await fileio.aopen(file_path, "rb")
                 return (ident, f)
             except (FileNotFoundError, TypeError):
                 pass
 
-    def _write_manifest(self):
-        with open(self._manifest_path, "w") as fp:
-            fp.write(json.dumps(list(self.q._queue)))
-
-    def _read_manifest(self):
+    async def _read_manifest(self):
         try:
-            with open(self._manifest_path, "r") as fp:
-                return json.load(fp)
+            async with fileio.Opened(self._manifest_path, "r") as fp:
+                data = await fp.read()
         except FileNotFoundError:
             return []
-        except JSONDecodeError:
-            with open(self._manifest_path, "r") as fp:
-                logger.error("failed to decode manifest: %s", fp.read())
-            raise
-
-    def _path_for_ident(self, ident):
-        return os.path.join(self._message_path, ident)
+        else:
+            try:
+                return json.loads(data)
+            except JSONDecodeError:
+                logger.error("failed to decode manifest: %s", data)
+            except Exception:
+                logger.exception("Unknown failure in decoding manifest: %s", data)
+            finally:
+                return []
 
     def _remove_path(self, path):
         if os.path.exists(path):
@@ -77,56 +92,30 @@ class DurableBuffer:
         else:
             logger.info("Can't remove {}, doesn't exist".format(path))
 
-    async def _get_file(self, ident, handle_only=False, delete=True):
-        """
-        Retrieves a file from disk. If handle_only is True then we will
-        return the handle to the file and do nothing else. Otherwise the file
-        is read into memory all at once and returned. If delete is True (the
-        default) and handle_only is False (the default) then the underlying
-        file will be removed as well.
-        """
-        path = self._path_for_ident(ident)
-        fp = await self._loop.run_in_executor(pool, open, path, "rb")
-        if handle_only:
-            return fp
-        bytes_ = await self._loop.run_in_executor(pool, fp.read)
-        fp.close()
-        if delete:
-            await self._loop.run_in_executor(pool, os.remove, path)
-        return bytes_
-
-    def _write_file(self, data, item):
-        with open(os.path.join(self._message_path, item["ident"]), "wb") as fp:
-            if isinstance(data, bytes):
-                fp.write(data)
-            else:
-                for chunk in data:
-                    fp.write(chunk)
-
     async def expire(self):
         async with self._manifest_lock:
-            new_queue = asyncio.Queue()
-            while self.q.qsize() > 0:
-                item = await self.q.get()
-                ident = item["ident"]
+            old, self.q = self.q, asyncio.Queue()
+            while old.qsize() > 0:
+                item = await old.get()
+                path = item["path"]
                 expire_time = item["expire_time"]
                 if expire_time < datetime.datetime.utcnow():
-                    logger.info("Expiring message %s", ident)
-                    # TODO: Do something with expired message
-                    await self._loop.run_in_executor(
-                        pool, self._remove_path, self._path_for_ident(ident)
-                    )
+                    logger.info("Expiring message %s", path)
+                    await fileio.run_in_executor(self._remove_path, path)
                 else:
-                    await new_queue.put(item)
-            self.q = new_queue
-            self._write_manifest()
+                    await self.q.put(item)
+            self._manifest_dirty = True
 
     async def manifest_writer(self, write_time):
         while True:
             if self._manifest_dirty:
                 async with self._manifest_lock:
-                    await self._loop.run_in_executor(pool, self._write_manifest)
-                    self._manifest_dirty = False
+                    try:
+                        async with fileio.Opened(self._manifest_path, "w") as fp:
+                            await fp.write(json.dumps(list(self.q._queue)))
+                        self._manifest_dirty = False
+                    except Exception:
+                        logger.exception("Failed to write manifest for %s", self._manifest_path)
             await asyncio.sleep(write_time)
 
 
