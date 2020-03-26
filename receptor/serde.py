@@ -9,6 +9,7 @@ def decoder(typename):
     def _inner(func):
         decoders[typename] = func
         return func
+
     return _inner
 
 
